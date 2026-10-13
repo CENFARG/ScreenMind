@@ -10,13 +10,14 @@ Contributions are welcome — bug fixes, features, docs, tests, all of it.
    cd ScreenMind
    ```
 
-2. Install dependencies:
+2. Install dependencies. The project targets **Python 3.11** and uses
+   [`uv`](https://docs.astral.sh/uv/) for reproducible environments:
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # Windows: venv\Scripts\activate
-   pip install -r requirements.txt
-   pip install -r requirements-test.txt
+   uv venv -p 3.11 --seed
+   uv sync --extra dev          # or --all-extras for the full ML stack
    ```
+   `uv sync` installs from `uv.lock`, so every contributor gets the same set.
+   The legacy `pip install -r requirements.txt` flow still works.
 
 3. Set up a Gemma model (needed for the analysis engine):
    ```bash

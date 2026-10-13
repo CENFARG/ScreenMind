@@ -14,7 +14,7 @@
 [![PyPI](https://img.shields.io/pypi/v/screenmind?style=flat-square&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/screenmind/)
 [![CI](https://github.com/ayushh0110/ScreenMind/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushh0110/ScreenMind/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/ayushh0110/ScreenMind/graph/badge.svg)](https://codecov.io/gh/ayushh0110/ScreenMind)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Gemma 4](https://img.shields.io/badge/Gemma_4-E2B_%7C_E4B_%7C_12B-8B5CF6?style=flat-square&logo=google&logoColor=white)](https://ai.google.dev/gemma)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-Local_Inference-333?style=flat-square)](https://github.com/ggerganov/llama.cpp)
 [![License MIT](https://img.shields.io/badge/License-MIT-10B981?style=flat-square)](LICENSE)
@@ -209,7 +209,7 @@ If you have more VRAM, E4B offers richer analysis. The 12B model gives the best 
 
 ## 🚀 Quick Start
 
-> **Requirements:** Python 3.10+ · GPU recommended (4GB+ VRAM) · ~2GB disk for model (E2B Q4_0)
+> **Requirements:** Python 3.11 · GPU recommended (4GB+ VRAM) · ~2GB disk for model (E2B Q4_0)
 
 #### 1️⃣ Install
 
@@ -702,20 +702,32 @@ Dark glassmorphism UI. No build step. Instant load.
 
 ## 🧪 Development
 
-Run the test suite:
+### Environment with `uv` (recommended)
+
+[`uv`](https://docs.astral.sh/uv/) provisions the pinned interpreter and installs from `uv.lock` for reproducible environments.
 
 ```bash
-# Fast (lightweight deps — same as CI, ~2 min install)
-pip install -r requirements-test.txt
+uv venv -p 3.11 --seed              # create .venv with CPython 3.11
+uv pip install -e ".[ai,mcp,windows]"  # editable install with extras
+uv lock                             # (re)generate uv.lock
+uv sync --all-extras                # reproduce the locked environment
+```
+
+`uv.lock` is the canonical, reproducible dependency set. `requirements*.txt` are retained for CI compatibility.
+
+### Run the test suite
+
+```bash
+# Reproducible dev environment (core deps + test tooling)
+uv sync --extra dev
 pytest --cov=. --cov-report=term-missing -q
 
-# Full (includes ML models — sentence-transformers, easyocr)
-pip install -r requirements.txt
-pip install pytest pytest-asyncio pytest-cov
+# Everything, including the heavy ML extras (sentence-transformers, easyocr, torch)
+uv sync --all-extras
 pytest --cov=. --cov-report=term-missing -q
 ```
 
-CI runs automatically on push/PR via GitHub Actions using the lightweight deps.
+CI runs automatically on push/PR via GitHub Actions using the lightweight `requirements-test.txt` set to keep the pipeline fast.
 
 ---
 
