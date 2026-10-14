@@ -79,6 +79,20 @@ def _too_many_attempts(retry_after: int) -> JSONResponse:
     return response
 
 
+async def _read_json(request: Request):
+    """Parse a JSON body, returning (body, error_response).
+
+    On malformed/missing JSON the error_response (400) is returned and the
+    caller must NOT consume a rate-limit slot for the aborted request.
+    """
+    try:
+        return await request.json(), None
+    except Exception:
+        return None, JSONResponse(
+            {"ok": False, "error": "Invalid request"}, status_code=400
+        )
+
+
 @router.get("/status")
 async def auth_status(request: Request):
     """Check if PIN is set and if current session is valid."""
@@ -97,7 +111,12 @@ async def auth_status(request: Request):
             setup_complete = data.get("setup_complete", bool(data))
     except Exception:
         pass
-    return {"has_pin": has_pin, "authenticated": authenticated, "first_run": not setup_complete}
+    # Recovery: no PIN always means the dashboard must (re-)run setup, even if
+    # setup_complete was persisted. Clearing dashboard_pin_hash from
+    # settings.json therefore restores a usable setup screen instead of a
+    # broken "unlocked but every call 401s" state.
+    first_run = (not setup_complete) or (not has_pin)
+    return {"has_pin": has_pin, "authenticated": authenticated, "first_run": first_run}
 
 
 @router.post("/setup-complete")
@@ -109,7 +128,9 @@ async def mark_setup_complete(request: Request):
     overwrite the operator's PIN (PIN rotation goes through /set-pin). An
     empty PIN never unlocks the dashboard (fail-closed).
     """
-    body = await request.json()
+    body, error = await _read_json(request)
+    if error:
+        return error
     pin = _pin_from_body(body)
     if not pin:
         return JSONResponse({"ok": False, "error": "PIN required"}, status_code=400)
@@ -128,13 +149,18 @@ async def mark_setup_complete(request: Request):
 @router.post("/verify")
 async def verify_pin(request: Request):
     """Verify PIN and create a session. Rate-limited per client (fail-closed)."""
+    # Parse first: a malformed body must not burn a rate-limit slot. The
+    # reservation below and _verify_pin run with no await between them, so
+    # concurrent attempts still cannot over-spend the budget.
+    body, error = await _read_json(request)
+    if error:
+        return error
+    pin = _pin_from_body(body)
+
     client_id = _client_id(request)
     allowed, retry_after = reserve_pin_attempt(client_id)
     if not allowed:
         return _too_many_attempts(retry_after)
-
-    body = await request.json()
-    pin = _pin_from_body(body)
 
     if _verify_pin(pin, settings.dashboard_pin_hash):
         reset_pin_failures(client_id)
@@ -149,7 +175,9 @@ async def verify_pin(request: Request):
 @router.post("/set-pin")
 async def set_pin(request: Request):
     """Set or change the dashboard PIN. The PIN is mandatory (never cleared)."""
-    body = await request.json()
+    body, error = await _read_json(request)
+    if error:
+        return error
     pin = _pin_from_body(body)
     current = _pin_from_body(body, "current_pin")
 

@@ -83,6 +83,9 @@ def test_auth_status_fail_closed_without_pin():
     data = resp.json()
     assert data["has_pin"] is False
     assert data["authenticated"] is False
+    # No PIN always means setup is (re-)offered, so clearing the PIN on disk
+    # is a usable recovery path rather than a broken "unlocked but 401" state.
+    assert data["first_run"] is True
 
 
 def test_verify_with_empty_pin_is_rejected():
@@ -138,7 +141,8 @@ def test_setup_complete_first_run_sets_pin_and_session():
 def test_hash_is_salted_pbkdf2_and_verifies():
     stored = _hash_pin("1234")
     assert "$" in stored
-    salt, digest = stored.split("$")
+    assert len(stored.split("$")) == 2  # exactly 'salt$hash'
+    salt, digest, *_ = stored.split("$")
     assert len(salt) == 32  # 16 random bytes, hex-encoded
     assert len(digest) == 64  # PBKDF2-SHA256 output, hex-encoded
     assert _verify_pin("1234", stored) is True
@@ -248,3 +252,21 @@ def test_reserve_attempt_is_fail_closed(monkeypatch):
     assert deps.reserve_pin_attempt("c2")[0] is True
     deps.reset_pin_failures("c1")
     assert deps.reserve_pin_attempt("c1")[0] is True
+
+
+def test_malformed_body_does_not_consume_attempt_budget(monkeypatch):
+    """A malformed request must not burn a rate-limit slot (default 1 here)."""
+    settings.dashboard_pin_hash = _hash_pin("1234")
+    monkeypatch.setattr(settings, "dashboard_pin_max_attempts", 1)
+
+    client = TestClient(_make_app())
+    bad = client.post(
+        "/api/auth/verify",
+        content="not-json",
+        headers={"content-type": "application/json"},
+    )
+    assert bad.status_code == 400
+    # The single allowed attempt is still available and is evaluated (401).
+    assert client.post("/api/auth/verify", json={"pin": "0000"}).status_code == 401
+    # Only now is the budget exhausted.
+    assert client.post("/api/auth/verify", json={"pin": "1234"}).status_code == 429
