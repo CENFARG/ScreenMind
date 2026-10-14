@@ -283,7 +283,12 @@ class Settings(BaseSettings):
             "fail-closed LOCKED until an operator sets one (PIN is mandatory)."
         ),
     )
-    dashboard_lock_timeout: int = Field(default=30, description="Minutes before dashboard auto-locks")
+    dashboard_lock_timeout: int = Field(
+        default=30,
+        ge=0,
+        le=1440,
+        description="Minutes before dashboard auto-locks (0 falls back to 30).",
+    )
     # PIN brute-force throttling. Environment-only (absent from
     # _ALLOWED_OVERRIDES): neither settings.json nor the dashboard can widen
     # these limits at runtime, so the lockout cannot be relaxed remotely.

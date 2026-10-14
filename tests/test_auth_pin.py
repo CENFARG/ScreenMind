@@ -105,6 +105,34 @@ def test_set_pin_requires_a_non_empty_pin():
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize("payload", [{"pin": None}, {"pin": 1234}, {"pin": {"x": 1}}])
+def test_non_string_pin_is_treated_as_empty(payload):
+    client = TestClient(_make_app())
+    assert client.post("/api/auth/setup-complete", json=payload).status_code == 400
+    assert client.post("/api/auth/set-pin", json=payload).status_code == 400
+    assert client.post("/api/auth/verify", json=payload).status_code == 401
+
+
+def test_setup_complete_refuses_when_a_pin_already_exists():
+    """Regression: setup is first-run only — it must never overwrite the PIN."""
+    settings.dashboard_pin_hash = _hash_pin("1234")
+    client = TestClient(_make_app())
+    resp = client.post("/api/auth/setup-complete", json={"pin": "attacker"})
+    assert resp.status_code == 401
+    # The original PIN still works; the attacker's does not.
+    assert _verify_pin("1234", settings.dashboard_pin_hash) is True
+    assert client.post("/api/auth/verify", json={"pin": "1234"}).status_code == 200
+    assert client.post("/api/auth/verify", json={"pin": "attacker"}).status_code == 401
+
+
+def test_setup_complete_first_run_sets_pin_and_session():
+    client = TestClient(_make_app())
+    resp = client.post("/api/auth/setup-complete", json={"pin": "1234"})
+    assert resp.status_code == 200
+    assert resp.json()["pin_set"] is True
+    assert _verify_pin("1234", settings.dashboard_pin_hash) is True
+
+
 # ── CT-06.2: PIN stored as a salted PBKDF2-SHA256 hash ───────────────
 
 def test_hash_is_salted_pbkdf2_and_verifies():
@@ -185,3 +213,38 @@ def test_rate_limit_resets_after_successful_verify(monkeypatch):
     assert resp.status_code == 200
     # A successful entry clears the failure window for this client.
     assert not deps._pin_failures.get("testclient")
+
+
+def test_set_pin_current_pin_oracle_is_rate_limited(monkeypatch):
+    """Regression: changing a PIN must not be an unthrottled PIN oracle."""
+    settings.dashboard_pin_hash = _hash_pin("1234")
+    monkeypatch.setattr(settings, "dashboard_pin_max_attempts", 3)
+
+    client = TestClient(_make_app())
+    for _ in range(3):
+        resp = client.post(
+            "/api/auth/set-pin", json={"pin": "newpass", "current_pin": "0000"}
+        )
+        assert resp.status_code == 401
+
+    resp = client.post(
+        "/api/auth/set-pin", json={"pin": "newpass", "current_pin": "0000"}
+    )
+    assert resp.status_code == 429
+    # The existing PIN was never changed.
+    assert _verify_pin("1234", settings.dashboard_pin_hash) is True
+
+
+def test_reserve_attempt_is_fail_closed(monkeypatch):
+    monkeypatch.setattr(settings, "dashboard_pin_max_attempts", 2)
+    allowed, _ = deps.reserve_pin_attempt("c1")
+    assert allowed is True
+    allowed, _ = deps.reserve_pin_attempt("c1")
+    assert allowed is True
+    allowed, retry_after = deps.reserve_pin_attempt("c1")
+    assert allowed is False
+    assert retry_after > 0
+    # A different client is unaffected; a successful PIN clears the window.
+    assert deps.reserve_pin_attempt("c2")[0] is True
+    deps.reset_pin_failures("c1")
+    assert deps.reserve_pin_attempt("c1")[0] is True

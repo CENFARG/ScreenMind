@@ -22,8 +22,7 @@ from screenmind.api.dependencies import (
     SESSION_COOKIE,
     create_session,
     delete_session,
-    pin_rate_limit_status,
-    record_pin_failure,
+    reserve_pin_attempt,
     reset_pin_failures,
     set_session_cookie,
     verify_session,
@@ -61,6 +60,25 @@ def _client_id(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _pin_from_body(body: dict, key: str = "pin") -> str:
+    """Read a PIN-ish field as a stripped string.
+
+    Non-string values (null, numbers, objects) normalise to "" so they are
+    treated as an empty PIN everywhere — never as a literal like "None".
+    """
+    value = body.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _too_many_attempts(retry_after: int) -> JSONResponse:
+    response = JSONResponse(
+        {"ok": False, "error": "Too many attempts", "retry_after": retry_after},
+        status_code=429,
+    )
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
 @router.get("/status")
 async def auth_status(request: Request):
     """Check if PIN is set and if current session is valid."""
@@ -86,15 +104,18 @@ async def auth_status(request: Request):
 async def mark_setup_complete(request: Request):
     """First-run setup: set the mandatory PIN and mark setup complete.
 
-    A PIN is REQUIRED — setup cannot be completed without one, so an empty
-    PIN never unlocks the dashboard (fail-closed).
+    A PIN is REQUIRED and this endpoint is FIRST-RUN ONLY: if a PIN already
+    exists it is refused outright, so an unauthenticated caller can never
+    overwrite the operator's PIN (PIN rotation goes through /set-pin). An
+    empty PIN never unlocks the dashboard (fail-closed).
     """
     body = await request.json()
-    pin = str(body.get("pin", "")).strip()
+    pin = _pin_from_body(body)
     if not pin:
+        return JSONResponse({"ok": False, "error": "PIN required"}, status_code=400)
+    if settings.dashboard_pin_hash:
         return JSONResponse(
-            {"ok": False, "error": "PIN required"},
-            status_code=400,
+            {"ok": False, "error": "PIN already set"}, status_code=401
         )
     settings.save_runtime_overrides(
         {"setup_complete": True, "dashboard_pin_hash": _hash_pin(pin)}
@@ -108,17 +129,12 @@ async def mark_setup_complete(request: Request):
 async def verify_pin(request: Request):
     """Verify PIN and create a session. Rate-limited per client (fail-closed)."""
     client_id = _client_id(request)
-    allowed, retry_after = pin_rate_limit_status(client_id)
+    allowed, retry_after = reserve_pin_attempt(client_id)
     if not allowed:
-        response = JSONResponse(
-            {"ok": False, "error": "Too many attempts", "retry_after": retry_after},
-            status_code=429,
-        )
-        response.headers["Retry-After"] = str(retry_after)
-        return response
+        return _too_many_attempts(retry_after)
 
     body = await request.json()
-    pin = str(body.get("pin", ""))
+    pin = _pin_from_body(body)
 
     if _verify_pin(pin, settings.dashboard_pin_hash):
         reset_pin_failures(client_id)
@@ -126,7 +142,7 @@ async def verify_pin(request: Request):
         response = JSONResponse({"ok": True})
         return set_session_cookie(response, token)
 
-    record_pin_failure(client_id)
+    # The attempt slot was already reserved by reserve_pin_attempt().
     return JSONResponse({"ok": False, "error": "Invalid PIN"}, status_code=401)
 
 
@@ -134,19 +150,24 @@ async def verify_pin(request: Request):
 async def set_pin(request: Request):
     """Set or change the dashboard PIN. The PIN is mandatory (never cleared)."""
     body = await request.json()
-    pin = str(body.get("pin", "")).strip()
-    current = str(body.get("current_pin", ""))
+    pin = _pin_from_body(body)
+    current = _pin_from_body(body, "current_pin")
 
     if not pin:
-        return JSONResponse(
-            {"ok": False, "error": "PIN required"},
-            status_code=400,
-        )
+        return JSONResponse({"ok": False, "error": "PIN required"}, status_code=400)
 
-    # If a PIN is already set, the current PIN must be verified first.
+    # If a PIN is already set, the current PIN must be verified first. That
+    # check is a PIN oracle, so it is rate-limited exactly like /verify.
     if settings.dashboard_pin_hash:
+        client_id = _client_id(request)
+        allowed, retry_after = reserve_pin_attempt(client_id)
+        if not allowed:
+            return _too_many_attempts(retry_after)
         if not _verify_pin(current, settings.dashboard_pin_hash):
-            return JSONResponse({"ok": False, "error": "Current PIN incorrect"}, status_code=401)
+            return JSONResponse(
+                {"ok": False, "error": "Current PIN incorrect"}, status_code=401
+            )
+        reset_pin_failures(client_id)
 
     new_hash = _hash_pin(pin)
     settings.save_runtime_overrides({"dashboard_pin_hash": new_hash})

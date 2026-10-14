@@ -64,38 +64,50 @@ def set_session_cookie(response, token: str):
 
 
 # ── PIN brute-force rate limiter (in-memory, per client) ─────────────
-# Sliding-window counter of recent failed PIN attempts, keyed by client IP.
-# Fail-closed: once the window is full every further attempt (even a correct
-# PIN) is rejected until the oldest failure ages out.
-_pin_failures = {}  # client_id -> list[datetime utc] of recent failures
+# Sliding-window counter of recent PIN attempts, keyed by client IP.
+# Fail-closed: an attempt RESERVES its slot before it is evaluated, so a burst
+# of concurrent requests cannot slip past the check, and once the window is
+# full every further attempt (even a correct PIN) is rejected until it ages out.
+_pin_failures = {}  # client_id -> list[datetime utc] of recent attempts
+_LIMITER_SWEEP_THRESHOLD = 256
 
 
-def _active_failures(client_id: str, now: datetime, window: int):
-    failures = _pin_failures.get(client_id, [])
-    return [t for t in failures if (now - t).total_seconds() < window]
+def _pruned(client_id: str, now: datetime, window: int):
+    return [
+        t
+        for t in _pin_failures.get(client_id, [])
+        if (now - t).total_seconds() < window
+    ]
 
 
-def pin_rate_limit_status(client_id: str):
-    """Return (allowed, retry_after_seconds) for a new PIN attempt."""
+def reserve_pin_attempt(client_id: str):
+    """Atomically check the window and reserve a slot for one PIN attempt.
+
+    Returns (allowed, retry_after_seconds). Fail-closed: the slot is recorded
+    up-front, so the caller MUST call reset_pin_failures() when the PIN is
+    correct. There is no await between the check and the reservation, so
+    concurrent attempts from one client cannot over-spend the budget.
+    """
     max_attempts = settings.dashboard_pin_max_attempts or 5
     window = settings.dashboard_pin_lockout_seconds or 60
     now = datetime.utcnow()
-    failures = _active_failures(client_id, now, window)
-    _pin_failures[client_id] = failures
+
+    # Opportunistic cleanup: drop clients whose window has fully aged out.
+    if len(_pin_failures) > _LIMITER_SWEEP_THRESHOLD:
+        for cid in list(_pin_failures):
+            if cid != client_id and not _pruned(cid, now, window):
+                _pin_failures.pop(cid, None)
+
+    failures = _pruned(client_id, now, window)
     if len(failures) >= max_attempts:
+        _pin_failures[client_id] = failures
         oldest = min(failures)
         retry_after = int(window - (now - oldest).total_seconds()) + 1
         return False, max(retry_after, 1)
-    return True, 0
 
-
-def record_pin_failure(client_id: str):
-    """Record a failed PIN attempt for the given client."""
-    now = datetime.utcnow()
-    window = settings.dashboard_pin_lockout_seconds or 60
-    failures = _active_failures(client_id, now, window)
     failures.append(now)
     _pin_failures[client_id] = failures
+    return True, 0
 
 
 def reset_pin_failures(client_id: str):
