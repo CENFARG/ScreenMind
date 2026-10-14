@@ -16,8 +16,10 @@ Per-app pHash cache avoids redundant processing for similar screens:
 """
 
 import asyncio
+import json
 import logging
 import re
+import shutil
 import time
 from collections import OrderedDict, deque
 from datetime import datetime
@@ -101,6 +103,7 @@ class AnalysisWorker:
         self._running = False
         self._processed = 0
         self._errors = 0
+        self._quarantined = 0  # Fail-closed PII quarantines (never inferred)
         self._is_backfill = False  # Set by _backfill_skipped for method labeling
 
         # Lazy-init embedder (large model download on first use)
@@ -362,15 +365,18 @@ class AnalysisWorker:
                             ocr_text = ocr_raw
                             text_method = "ocr"
 
-            # 3c. Sensitive data filter — redact before AI + storage
+            # 3c. Sensitive data filter — redact BEFORE AI + storage (fail-closed)
             if settings.sensitive_filter_enabled and ocr_text:
                 try:
-                    from screenmind.privacy.data_filter import filter_sensitive_text, parse_enabled_types
+                    from screenmind.privacy.data_filter import redact_or_raise, parse_enabled_types
                     enabled_types = parse_enabled_types(settings.sensitive_filter_types)
-                    filter_result = filter_sensitive_text(ocr_text, enabled_types)
+                    filter_result = redact_or_raise(ocr_text, enabled_types)
                     ocr_text = filter_result["clean_text"]
                 except Exception as e:
-                    logger.warning(f"Sensitive filter error: {e}")
+                    # FAIL-CLOSED: if redaction cannot be guaranteed we must not
+                    # persist the text nor send it to the model. Quarantine it.
+                    self._quarantine(capture, activity_id, reason=str(e))
+                    return
 
             # 3d. Extract URLs from text (for Gemma hint + DB storage)
             found_urls = _extract_all_urls(ocr_text)
@@ -640,6 +646,53 @@ class AnalysisWorker:
                 status="failed",
             )
 
+    def _quarantine(self, capture: CaptureResult, activity_id: Optional[int], reason: str):
+        """Fail-closed PII quarantine: keep the capture local, never infer.
+
+        Called when the sensitive-data filter cannot guarantee redaction. The
+        raw text is never written to the DB and never sent to the model; the
+        screenshot is copied to a local quarantine folder and the row is marked
+        so it is skipped by backfill and stays visible for human review.
+        """
+        self._quarantined += 1
+        logger.warning(
+            f"PII filter could not guarantee redaction for #{activity_id} — "
+            f"quarantined (no inference, no persistence)"
+        )
+
+        # 1. Best-effort local artifact: screenshot copy + manifest (no raw text).
+        try:
+            qdir = Path(settings.data_path) / "quarantine"
+            qdir.mkdir(parents=True, exist_ok=True)
+            src = Path(capture.filepath) if capture.filepath else None
+            if src and src.exists():
+                shutil.copy2(str(src), str(qdir / src.name))
+            (qdir / f"activity_{activity_id or 'unknown'}.json").write_text(
+                json.dumps({
+                    "activity_id": activity_id,
+                    "timestamp": str(capture.timestamp),
+                    "app_name": capture.app_name,
+                    "reason": reason[:200],
+                    "status": "quarantined",
+                }, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.debug(f"Quarantine artifact write failed (non-fatal): {e}")
+
+        # 2. Mark the row so it is excluded from backfill and inference.
+        if activity_id:
+            try:
+                conn = self._db._get_conn()
+                conn.execute(
+                    "UPDATE activities SET analyzed = 1, status = 'quarantined', "
+                    "analysis_error = ?, ocr_text = NULL WHERE id = ?",
+                    (f"Sensitive filter failed: {reason[:150]}", activity_id),
+                )
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to mark #{activity_id} as quarantined: {e}")
+
     async def _backfill_skipped(self):
         """Re-analyze one unanalyzed or skipped entry when idle.
         Catches: entries from crashes (analyzed=0) + stale skips.
@@ -744,6 +797,7 @@ class AnalysisWorker:
             "running": self._running,
             "processed": self._processed,
             "errors": self._errors,
+            "quarantined": self._quarantined,
             "queue_size": self._queue.qsize(),
             "embedder_available": self._embedder_available,
             "cache_hits": self._cache_hits,
