@@ -79,6 +79,9 @@ _ALLOWED_OVERRIDES = {
     "notion_enabled", "notion_token", "notion_database_id",
     "webhook_enabled", "webhook_url", "webhook_events", "webhook_secret", "webhook_headers",
     "webhook_extra",
+    # NOTE: "webhook_egress_allowlist" is intentionally NOT listed here. The
+    # outbound-egress allowlist is environment-only so settings.json / the
+    # dashboard cannot widen webhook destinations at runtime (fail-closed).
     "smart_notifications", "distraction_minutes", "break_reminder_minutes",
     "auto_bookmark", "auto_bookmark_keywords",
     "agents_enabled", "agents_auto_run_python",
@@ -243,6 +246,18 @@ class Settings(BaseSettings):
     webhook_secret: str = Field(default="", description="Optional HMAC secret for webhook signing")
     webhook_headers: str = Field(default="", description="Custom headers as Key: Value lines")
     webhook_extra: str = Field(default="[]", description="JSON array of extra named webhook profiles")
+    # Egress lockdown (Ola2-T2.5): environment-only HTTPS allowlist. Empty value
+    # means NO webhook egress is permitted (deny-by-default). This field is not
+    # runtime-overridable (absent from _ALLOWED_OVERRIDES), so settings.json
+    # cannot add destinations outside the operator-controlled allowlist.
+    webhook_egress_allowlist: str = Field(
+        default="",
+        description=(
+            "Comma-separated HTTPS URL allowlist for outbound webhook egress "
+            "(env WEBHOOK_EGRESS_ALLOWLIST). Empty = all webhook egress denied. "
+            "Not overridable from settings.json."
+        ),
+    )
 
     # ── Smart Notifications ──────────────────────────────────────────────
     smart_notifications: bool = Field(default=True, description="Enable smart usage notifications")

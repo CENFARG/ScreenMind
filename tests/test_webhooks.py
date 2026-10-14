@@ -12,6 +12,16 @@ from screenmind.integrations.webhooks import (
     _delivery_log,
     _log_lock,
 )
+from screenmind.config import settings as _settings
+
+
+def _allow_egress(monkeypatch, *urls):
+    """Point the env-only webhook allowlist at the given test URLs.
+
+    Since Ola2-T2.5 webhook egress is deny-by-default and TLS-only, so any
+    test that expects a real HTTP POST must first permit its destination.
+    """
+    monkeypatch.setattr(_settings, "webhook_egress_allowlist", ",".join(urls))
 
 
 # ── _parse_headers ──────────────────────────────────────────────────────
@@ -62,7 +72,8 @@ class TestFire:
 
 class TestSend:
     @patch("screenmind.integrations.webhooks.urllib.request.urlopen")
-    def test_success(self, mock_urlopen):
+    def test_success(self, mock_urlopen, monkeypatch):
+        _allow_egress(monkeypatch, "https://hooks.example.com/ingest")
         mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
@@ -70,11 +81,12 @@ class TestSend:
         mock_urlopen.return_value = mock_resp
 
         payload = {"event": "test", "data": {}}
-        result = _send("http://example.com", payload, "", {}, "test")
+        result = _send("https://hooks.example.com/ingest", payload, "", {}, "test")
         assert result is True
 
     @patch("screenmind.integrations.webhooks.urllib.request.urlopen")
-    def test_hmac_signing(self, mock_urlopen):
+    def test_hmac_signing(self, mock_urlopen, monkeypatch):
+        _allow_egress(monkeypatch, "https://hooks.example.com/ingest")
         mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
@@ -83,7 +95,7 @@ class TestSend:
 
         payload = {"event": "test"}
         secret = "mysecret"
-        _send("http://example.com", payload, secret, {}, "test")
+        _send("https://hooks.example.com/ingest", payload, secret, {}, "test")
 
         # Verify the request was made with HMAC header
         call_args = mock_urlopen.call_args
@@ -91,19 +103,21 @@ class TestSend:
         assert "X-Screenmind-Signature" in req.headers or "X-screenmind-signature" in req.headers
 
     @patch("screenmind.integrations.webhooks.urllib.request.urlopen")
-    def test_http_error(self, mock_urlopen):
+    def test_http_error(self, mock_urlopen, monkeypatch):
         import urllib.error
+        _allow_egress(monkeypatch, "https://hooks.example.com/ingest")
         mock_urlopen.side_effect = urllib.error.HTTPError(
-            "http://example.com", 500, "Server Error", {}, None
+            "https://hooks.example.com/ingest", 500, "Server Error", {}, None
         )
-        result = _send("http://example.com", {}, "", {}, "test")
+        result = _send("https://hooks.example.com/ingest", {}, "", {}, "test")
         assert result is False
 
     @patch("screenmind.integrations.webhooks.urllib.request.urlopen")
-    def test_url_error(self, mock_urlopen):
+    def test_url_error(self, mock_urlopen, monkeypatch):
         import urllib.error
+        _allow_egress(monkeypatch, "https://hooks.example.com/ingest")
         mock_urlopen.side_effect = urllib.error.URLError("Connection refused")
-        result = _send("http://example.com", {}, "", {}, "test")
+        result = _send("https://hooks.example.com/ingest", {}, "", {}, "test")
         assert result is False
 
 
@@ -115,21 +129,23 @@ class TestWebhookPing:
         assert result["ok"] is False
 
     @patch("screenmind.integrations.webhooks.urllib.request.urlopen")
-    def test_success(self, mock_urlopen):
+    def test_success(self, mock_urlopen, monkeypatch):
+        _allow_egress(monkeypatch, "https://hooks.example.com/ingest")
         mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
 
-        result = webhook_ping("http://example.com")
+        result = webhook_ping("https://hooks.example.com/ingest")
         assert result["ok"] is True
         assert result["status"] == 200
 
     @patch("screenmind.integrations.webhooks.urllib.request.urlopen")
-    def test_failure(self, mock_urlopen):
+    def test_failure(self, mock_urlopen, monkeypatch):
+        _allow_egress(monkeypatch, "https://hooks.example.com/ingest")
         mock_urlopen.side_effect = Exception("Connection refused")
-        result = webhook_ping("http://example.com")
+        result = webhook_ping("https://hooks.example.com/ingest")
         assert result["ok"] is False
 
 

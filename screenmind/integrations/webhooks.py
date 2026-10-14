@@ -6,6 +6,7 @@ Webhook Integration (v3)
 - fire() kept backward-compatible (raw threads)
 - Retry once on failure (after 5s)
 - Custom headers + HMAC signing
+- Fail-closed egress: env allowlist + TLS-only, deny-by-default (Ola2-T2.5)
 """
 
 import logging
@@ -20,10 +21,79 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from screenmind.config import settings
 
 logger = logging.getLogger("screenmind.integrations.webhooks")
+
+
+# ── Egress lockdown (fail-closed) ───────────────────────────────────────
+# Ola2-T2.5: every outbound webhook POST must clear a single deny-by-default
+# gate before any bytes are written to the socket. Two independent conditions
+# must hold, and neither can be relaxed from settings.json:
+#   1. The destination URL is listed in the environment allowlist
+#      (WEBHOOK_EGRESS_ALLOWLIST). An empty allowlist denies EVERYTHING.
+#   2. The transport is TLS-secured: https://, or http:// to loopback only.
+# This gate is enforced at the choke points that actually emit bytes
+# (_send and test_webhook), so no caller can bypass it.
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _parse_allowlist(raw) -> list:
+    """Parse the comma-separated allowlist. Non-strings / blanks deny all."""
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    return [_normalize_url(u) for u in raw.split(",") if u.strip()]
+
+
+def _normalize_url(url: str) -> str:
+    """Trim surrounding whitespace and a single trailing slash for matching."""
+    u = (url or "").strip()
+    return u[:-1] if u.endswith("/") else u
+
+
+def _is_tls_ok(url: str) -> bool:
+    """https:// always ok; http:// only to loopback; everything else rejected."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme == "https":
+        return True
+    if parts.scheme == "http":
+        return parts.hostname in _LOOPBACK_HOSTS
+    return False
+
+
+def is_egress_allowed(url: str) -> bool:
+    """Fail-closed webhook egress gate.
+
+    Returns True only when ``url`` is (1) present in the environment allowlist
+    and (2) TLS-secured (https, or http to loopback). A missing/blank allowlist
+    denies every destination, and settings.json cannot widen it.
+    """
+    if not url or not url.strip():
+        return False
+    allowlist = _parse_allowlist(settings.webhook_egress_allowlist)
+    if not allowlist:
+        return False  # deny-by-default: no allowlist == no egress
+    if _normalize_url(url) not in allowlist:
+        return False  # destination not explicitly permitted
+    return _is_tls_ok(url)
+
+
+def _blocked(url: str, event: str, attempt: int = 1, hook_name: str = "default") -> None:
+    """Record and log a policy-blocked delivery (no bytes are emitted)."""
+    _log_delivery(
+        url, event, "blocked",
+        error="egress denied (allowlist/TLS)", attempt=attempt, hook_name=hook_name,
+    )
+    logger.warning(
+        "Webhook egress blocked (%s → %s): destination not allowlisted or not TLS",
+        event, url[:50],
+    )
 
 
 # ── Delivery Log (persistent SQLite) ────────────────────────────────────
@@ -334,6 +404,9 @@ def _parse_headers(headers_str: str) -> dict:
 
 def _send_with_retry(url: str, payload: dict, secret: str, custom_headers: dict, event: str):
     """Send webhook with one retry on failure. Used by fire() (backward compat)."""
+    if not is_egress_allowed(url):
+        _blocked(url, event, attempt=1)
+        return
     success = _send(url, payload, secret, custom_headers, event, attempt=1)
     if not success:
         time.sleep(5)
@@ -343,6 +416,9 @@ def _send_with_retry(url: str, payload: dict, secret: str, custom_headers: dict,
 def _send_with_retry_named(url: str, payload: dict, secret: str, custom_headers: dict,
                             event: str, hook_name: str = "default"):
     """Send webhook with one retry. Logs with hook_name. Used by fire_all()/send_to_hook()."""
+    if not is_egress_allowed(url):
+        _blocked(url, event, attempt=1, hook_name=hook_name)
+        return
     success = _send(url, payload, secret, custom_headers, event, attempt=1, hook_name=hook_name)
     if not success:
         time.sleep(5)
@@ -351,7 +427,14 @@ def _send_with_retry_named(url: str, payload: dict, secret: str, custom_headers:
 
 def _send(url: str, payload: dict, secret: str, custom_headers: dict,
           event: str, attempt: int = 1, hook_name: str = "default") -> bool:
-    """Actually send the webhook. Returns True on success."""
+    """Actually send the webhook. Returns True on success.
+
+    Fail-closed: if the destination does not clear the egress gate, the call
+    returns False WITHOUT opening a socket (no bytes are emitted).
+    """
+    if not is_egress_allowed(url):
+        _blocked(url, event, attempt=attempt, hook_name=hook_name)
+        return False
     try:
         body = json.dumps(payload).encode("utf-8")
 
@@ -398,6 +481,10 @@ def test_webhook(url: str, secret: str = "", headers: str = "") -> dict:
     """Send a test ping to the webhook URL. Returns status dict."""
     if not url:
         return {"ok": False, "error": "No URL provided"}
+
+    if not is_egress_allowed(url):
+        _blocked(url, "test")
+        return {"ok": False, "error": "egress denied: destination not allowlisted or not TLS"}
 
     payload = {
         "event": "test",
