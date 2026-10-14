@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from typing import Optional, List
+from urllib.parse import urlparse
 
 import httpx
 
@@ -24,10 +25,59 @@ logger = logging.getLogger("screenmind.engine.llm_client")
 INFERENCE_TIMEOUT = 300.0
 HEALTH_TIMEOUT = 5.0
 
+# Hosts considered loopback. Mirrors the allowlist already used by the API
+# server (see screenmind/api/routes/settings.py). llama-server MUST stay local:
+# ScreenMind is a single-machine, private tool and never sends captured content
+# to a remote inference server.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 class InferenceCancelled(Exception):
     """Raised when an in-flight inference is cancelled (e.g., chat pre-emption)."""
     pass
+
+
+class NonLoopbackHostError(ValueError):
+    """Raised when llama-server is configured on a non-loopback (remote) host."""
+    pass
+
+
+def _extract_host(value: str) -> str:
+    """Extract the lowercased hostname from a URL or bare host[:port] string."""
+    candidate = value.strip()
+    if not candidate:
+        return ""
+    # Prepend a scheme separator when absent so urlparse treats the value as a
+    # netloc ("127.0.0.1:5809" would otherwise parse "127.0.0.1" as the scheme).
+    parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+    return (parsed.hostname or "").lower()
+
+
+def assert_loopback(url: str) -> str:
+    """
+    Fail-closed guard: llama-server must only ever be reached on loopback.
+
+    A remote host would leak captured screen content off-device, so any
+    non-loopback address is rejected outright (no silent fallback, no
+    warning-only path).
+
+    Args:
+        url: llama-server base URL or bare host, e.g. "http://127.0.0.1:5809".
+
+    Returns:
+        The normalized hostname when it is a loopback host.
+
+    Raises:
+        NonLoopbackHostError: if the host is empty or not a loopback host.
+    """
+    host = _extract_host(url)
+    if host not in _LOOPBACK_HOSTS:
+        raise NonLoopbackHostError(
+            f"llama-server host {url!r} is not loopback (resolved host={host!r}). "
+            f"ScreenMind only talks to a local server "
+            f"({', '.join(sorted(_LOOPBACK_HOSTS))}); refusing to send data to a remote host."
+        )
+    return host
 
 
 # ── Cancellation state ──────────────────────────────────────────────────────
@@ -67,7 +117,11 @@ def is_inference_active() -> bool:
 
 
 def _base_url() -> str:
-    return settings.llama_server_host.rstrip("/")
+    base_url = settings.llama_server_host.rstrip("/")
+    # Fail closed: every HTTP path (chat, health, status) resolves its URL here,
+    # so a remote host is rejected before any request leaves the machine.
+    assert_loopback(base_url)
+    return base_url
 
 
 def chat(

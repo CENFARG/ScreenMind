@@ -5,7 +5,8 @@ from unittest.mock import patch, MagicMock, PropertyMock
 import httpx
 
 from screenmind.engine.llm_client import (
-    InferenceCancelled, cancel_current_inference, is_inference_active,
+    InferenceCancelled, NonLoopbackHostError, assert_loopback,
+    cancel_current_inference, is_inference_active,
     chat, chat_with_images, transcribe_audio, generate, is_available,
     get_server_status, _cancel_event, _client_lock,
 )
@@ -246,3 +247,57 @@ class TestHealthCheck:
         mock_get.return_value = MagicMock(status_code=503)
         status = get_server_status()
         assert status["status"] == "error"
+
+
+class TestLoopbackGuard:
+    """PR-10: llama-server must only ever be reached on loopback (fail-closed)."""
+
+    def test_accepts_loopback_ipv4(self):
+        assert assert_loopback("http://127.0.0.1:5809") == "127.0.0.1"
+
+    def test_accepts_localhost(self):
+        assert assert_loopback("http://localhost:5809") == "localhost"
+
+    def test_accepts_ipv6_loopback(self):
+        assert assert_loopback("http://[::1]:5809") == "::1"
+
+    def test_accepts_bare_host_with_port(self):
+        """A scheme-less host:port is not mistaken for a URL scheme."""
+        assert assert_loopback("127.0.0.1:5809") == "127.0.0.1"
+
+    def test_rejects_remote_ip(self):
+        with pytest.raises(NonLoopbackHostError):
+            assert_loopback("http://192.168.1.50:5809")
+
+    def test_rejects_remote_domain(self):
+        with pytest.raises(NonLoopbackHostError):
+            assert_loopback("http://api.example.com:5809")
+
+    def test_rejects_empty_host(self):
+        with pytest.raises(NonLoopbackHostError):
+            assert_loopback("")
+
+    def test_rejects_public_dns_name(self):
+        """A hostname that merely contains 'localhost' is still rejected."""
+        with pytest.raises(NonLoopbackHostError):
+            assert_loopback("http://localhost.evil.com:5809")
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_refuses_remote_host_before_http(self, mock_client_cls):
+        """chat() fails closed on a remote host before any HTTP call is made."""
+        with patch("screenmind.engine.llm_client.settings") as mock_settings:
+            mock_settings.llama_server_host = "http://10.0.0.5:5809"
+            with pytest.raises(NonLoopbackHostError):
+                chat([{"role": "user", "content": "hi"}])
+        mock_client_cls.return_value.post.assert_not_called()
+
+    @patch("screenmind.engine.llm_client.httpx.Client")
+    def test_chat_proceeds_on_loopback(self, mock_client_cls):
+        """chat() proceeds normally when the host is loopback."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client_cls.return_value.post.return_value = mock_resp
+        with patch("screenmind.engine.llm_client.settings") as mock_settings:
+            mock_settings.llama_server_host = "http://127.0.0.1:5809"
+            assert chat([{"role": "user", "content": "hi"}]) == "ok"
