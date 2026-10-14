@@ -1,13 +1,20 @@
 """Test API endpoints using FastAPI TestClient."""
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 
 @pytest.fixture
 def client():
-    """Create a test client with mocked dependencies."""
+    """Create an authenticated test client with mocked dependencies.
+
+    The PIN is mandatory, so we configure a real PIN and mint a valid session
+    instead of disabling auth (no production bypass).
+    """
+    import screenmind.api.dependencies as deps
+    from screenmind.api.routes.auth import _hash_pin
     from screenmind.api.server import create_app
     from screenmind.storage.database import Database
+    from screenmind.config import settings
     from fastapi.testclient import TestClient
 
     db = MagicMock(spec=Database)
@@ -17,12 +24,18 @@ def client():
     db.get_daily_summary.return_value = None
     db.get_rewind_data.return_value = []
 
-    app = create_app(database=db, capture_worker=MagicMock(), analysis_worker=MagicMock(), audio_worker=MagicMock())
+    original_pin = settings.dashboard_pin_hash
+    settings.dashboard_pin_hash = _hash_pin("test-pin")
+    session_token = deps.create_session()
 
-    # Bypass PIN lock middleware — tests shouldn't need auth
-    with patch("screenmind.api.server.settings") as mock_settings:
-        mock_settings.dashboard_pin_hash = None
-        yield TestClient(app)
+    app = create_app(database=db, capture_worker=MagicMock(), analysis_worker=MagicMock(), audio_worker=MagicMock())
+    test_client = TestClient(app)
+    test_client.headers["Cookie"] = f"{deps.SESSION_COOKIE}={session_token}"
+    try:
+        yield test_client
+    finally:
+        deps.delete_session(session_token)
+        settings.dashboard_pin_hash = original_pin
 
 
 def test_root_returns_html(client):

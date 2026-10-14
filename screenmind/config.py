@@ -275,8 +275,35 @@ class Settings(BaseSettings):
     # ── Privacy & Security ────────────────────────────────────────────────
     sensitive_filter_enabled: bool = Field(default=True, description="Filter sensitive data (cards, SSNs, API keys, emails, AR PII) from captured text")
     sensitive_filter_types: str = Field(default="credit_card,ssn,api_key,jwt,password,email,cuit,cbu,alias,dni", description="Comma-separated filter types")
-    dashboard_pin_hash: str = Field(default="", description="SHA-256 hash of dashboard PIN (empty = no lock)")
-    dashboard_lock_timeout: int = Field(default=30, description="Minutes before dashboard auto-locks")
+    dashboard_pin_hash: str = Field(
+        default="",
+        description=(
+            "PBKDF2-SHA256 hash of the dashboard PIN, 'salt$hash' format. "
+            "Empty = no PIN configured, in which case the dashboard is "
+            "fail-closed LOCKED until an operator sets one (PIN is mandatory)."
+        ),
+    )
+    dashboard_lock_timeout: int = Field(
+        default=30,
+        ge=0,
+        le=1440,
+        description="Minutes before dashboard auto-locks (0 falls back to 30).",
+    )
+    # PIN brute-force throttling. Environment-only (absent from
+    # _ALLOWED_OVERRIDES): neither settings.json nor the dashboard can widen
+    # these limits at runtime, so the lockout cannot be relaxed remotely.
+    dashboard_pin_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="Failed PIN attempts allowed per lockout window (env-only, fail-closed).",
+    )
+    dashboard_pin_lockout_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        description="Sliding window / lockout duration in seconds for PIN attempts (env-only).",
+    )
     encryption_enabled: bool = Field(default=False, description="Encrypt screenshots at rest (AES via OS keyring)")
 
     # ── Data Retention ───────────────────────────────────────────────────

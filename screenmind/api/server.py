@@ -30,27 +30,26 @@ class AuthMiddleware(BaseHTTPMiddleware):
     LOCALHOST_ONLY_PATHS = {"/api/capture/bookmark"}
 
     async def dispatch(self, request: Request, call_next):
-        # No PIN set — everything is open
-        if not settings.dashboard_pin_hash:
-            return await call_next(request)
-
         path = request.url.path
 
-        # Allow open paths (no auth required from anywhere)
+        # Allow open paths (bootstrap + auth flow, no session required)
         if path in self.OPEN_PATHS or any(path.startswith(p) for p in self.OPEN_PREFIXES):
             return await call_next(request)
 
-        # Localhost-only paths — SDK, timeline, bookmark (agents/MCP use these internally)
+        # Fail-closed: a valid session is the strongest credential. With no PIN
+        # configured there is no way to hold a valid session, so protected
+        # routes stay LOCKED (an unset/empty PIN never unlocks the dashboard).
+        if settings.dashboard_pin_hash and deps.verify_session(
+            request.cookies.get(deps.SESSION_COOKIE)
+        ):
+            return await call_next(request)
+
+        # Localhost-only paths — SDK, timeline, bookmark (agents/MCP use these
+        # internally from the local machine, without a dashboard session).
         if path in self.LOCALHOST_ONLY_PATHS or any(path.startswith(p) for p in self.LOCALHOST_ONLY_PREFIXES):
             client_host = request.client.host if request.client else None
             if client_host in ("127.0.0.1", "::1"):
                 return await call_next(request)
-            return JSONResponse({"error": "unauthorized", "locked": True}, status_code=401)
-
-        # Check session cookie
-        token = request.cookies.get("screenmind_session")
-        if deps.verify_session(token):
-            return await call_next(request)
 
         # Blocked
         return JSONResponse({"error": "unauthorized", "locked": True}, status_code=401)

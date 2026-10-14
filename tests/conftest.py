@@ -68,15 +68,22 @@ def sample_image():
 
 @pytest.fixture
 def app(db):
-    """Create a test FastAPI app with PIN auth disabled."""
+    """Create a test FastAPI app authenticated through the real PIN flow.
+
+    The PIN is mandatory, so instead of disabling auth (which would be a
+    production bypass) we configure a real PIN hash and mint a valid session
+    token for the client fixtures to present.
+    """
     import screenmind.api.dependencies as deps
+    from screenmind.api.routes.auth import _hash_pin
     from screenmind.api.server import create_app
 
-    # Directly clear PIN so auth middleware passes all requests during tests
     original_pin = settings.dashboard_pin_hash
-    settings.dashboard_pin_hash = ''
+    settings.dashboard_pin_hash = _hash_pin("test-pin")
+    session_token = deps.create_session()
 
     application = create_app(database=db)
+    application.state.test_session_token = session_token
 
     # Also patch the module-level db references in route modules
     # since they may have been imported with a previous db value
@@ -98,13 +105,17 @@ def app(db):
     yield application
 
     # Restore
+    deps.delete_session(session_token)
     settings.dashboard_pin_hash = original_pin
 
 
 @pytest.fixture
 async def client(app):
-    """Create a test HTTP client."""
+    """Create a test HTTP client carrying a valid session cookie."""
+    import screenmind.api.dependencies as deps
     from httpx import AsyncClient, ASGITransport
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
+        c.headers["Cookie"] = f"{deps.SESSION_COOKIE}={app.state.test_session_token}"
         yield c
