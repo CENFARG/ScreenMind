@@ -11,10 +11,10 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import List, Literal
 
 from pydantic_settings import BaseSettings
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 
 
@@ -124,9 +124,14 @@ class Settings(BaseSettings):
     )
 
     # ── Model ────────────────────────────────────────────────────────────
-    gemma_mode: Literal["local", "api"] = Field(
+    # VESTIGIAL / local-only: ScreenMind has no cloud inference path — the only
+    # LLM client is the loopback llama-server. gemma_mode is kept for .env /
+    # settings.json backward compatibility but is HARD-LOCKED to "local": any
+    # other value (e.g. "api") is ignored with a warning (fail-closed), so the
+    # latent remote-egress channel cannot be re-enabled from configuration.
+    gemma_mode: Literal["local"] = Field(
         default="local",
-        description="'local' for llama-server, 'api' for Google AI Studio (sends data to Google)",
+        description="VESTIGIAL, hard-locked to 'local'. Remote/API inference is disabled.",
     )
     ollama_model: str = Field(
         default="gemma4:e2b",
@@ -151,10 +156,6 @@ class Settings(BaseSettings):
     llama_server_port: int = Field(
         default=5809,
         description="llama-server port",
-    )
-    google_api_key: Optional[str] = Field(
-        default=None,
-        description="Google AI Studio API key (for api mode)",
     )
 
     # ── Developer Context ────────────────────────────────────────────────
@@ -284,6 +285,20 @@ class Settings(BaseSettings):
         "case_sensitive": False,
         "validate_assignment": True,
     }
+
+    # ── Validators ───────────────────────────────────────────────────────
+
+    @field_validator("gemma_mode", mode="before")
+    @classmethod
+    def _lock_local_only(cls, value):
+        """Fail-closed: force 'local' and warn on any remote-mode attempt."""
+        if isinstance(value, str) and value.strip().lower() != "local":
+            logger.warning(
+                "gemma_mode=%r ignored - ScreenMind is local-only; using 'local'. "
+                "Remote inference (e.g. Google AI Studio) is not supported.",
+                value,
+            )
+        return "local"
 
     # ── Derived Paths ────────────────────────────────────────────────────
 

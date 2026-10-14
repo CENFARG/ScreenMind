@@ -1,5 +1,10 @@
 """Tests for config.py — settings parsing and properties."""
 
+import logging
+
+import pytest
+from pydantic import ValidationError
+
 from screenmind.config import Settings
 
 
@@ -55,3 +60,41 @@ def test_data_path_resolution():
     s = Settings(data_dir="~/.screenmind")
     assert s.data_path.is_absolute()
     assert "~" not in str(s.data_path)
+
+
+# ── Vestigial config cleanup (PR-14): local-only, fail-closed ────────────────
+
+
+def test_gemma_mode_defaults_to_local():
+    assert Settings(data_dir="/tmp/test").gemma_mode == "local"
+
+
+def test_gemma_mode_api_kwarg_is_blocked(caplog):
+    """Constructing with 'api' collapses to 'local' and warns (no egress path)."""
+    with caplog.at_level(logging.WARNING, logger="screenmind.config"):
+        s = Settings(data_dir="/tmp/test", gemma_mode="api")
+    assert s.gemma_mode == "local"
+    assert any("local-only" in r.getMessage() for r in caplog.records)
+
+
+def test_gemma_mode_api_env_is_blocked(monkeypatch, caplog):
+    """A GEMMA_MODE=api in the environment is ignored at load time."""
+    monkeypatch.setenv("GEMMA_MODE", "api")
+    with caplog.at_level(logging.WARNING, logger="screenmind.config"):
+        s = Settings(data_dir="/tmp/test")
+    assert s.gemma_mode == "local"
+    assert any("local-only" in r.getMessage() for r in caplog.records)
+
+
+def test_gemma_mode_assignment_is_locked():
+    """validate_assignment stays fail-closed: later writes can't enable api."""
+    s = Settings(data_dir="/tmp/test")
+    s.gemma_mode = "api"
+    assert s.gemma_mode == "local"
+
+
+def test_google_api_key_field_removed():
+    """The vestigial Google API key field no longer exists (no secret sink)."""
+    assert "google_api_key" not in Settings.model_fields
+    with pytest.raises(ValidationError):
+        Settings(data_dir="/tmp/test", google_api_key="leak")
