@@ -258,8 +258,8 @@ class Settings(BaseSettings):
     agents_auto_run_python: bool = Field(default=False, description="Run Python plugins without confirmation (default: ask)")
 
     # ── Privacy & Security ────────────────────────────────────────────────
-    sensitive_filter_enabled: bool = Field(default=True, description="Filter sensitive data (credit cards, SSNs, API keys) from captured text")
-    sensitive_filter_types: str = Field(default="credit_card,ssn,api_key,jwt,password", description="Comma-separated filter types")
+    sensitive_filter_enabled: bool = Field(default=True, description="Filter sensitive data (cards, SSNs, API keys, emails, AR PII) from captured text")
+    sensitive_filter_types: str = Field(default="credit_card,ssn,api_key,jwt,password,email,cuit,cbu,alias,dni", description="Comma-separated filter types")
     dashboard_pin_hash: str = Field(default="", description="SHA-256 hash of dashboard PIN (empty = no lock)")
     dashboard_lock_timeout: int = Field(default=30, description="Minutes before dashboard auto-locks")
     encryption_enabled: bool = Field(default=False, description="Encrypt screenshots at rest (AES via OS keyring)")

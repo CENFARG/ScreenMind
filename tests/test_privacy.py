@@ -1,6 +1,10 @@
 """Tests for privacy/data_filter.py — sensitive data redaction."""
 
-from screenmind.privacy.data_filter import filter_sensitive_text, parse_enabled_types
+from screenmind.privacy.data_filter import (
+    DEFAULT_ENABLED_TYPES,
+    filter_sensitive_text,
+    parse_enabled_types,
+)
 
 
 def test_redact_credit_card():
@@ -81,7 +85,7 @@ def test_multiple_redactions():
 
 def test_parse_enabled_types():
     assert parse_enabled_types("credit_card,ssn") == ["credit_card", "ssn"]
-    assert parse_enabled_types("") == ["credit_card", "ssn", "api_key", "jwt", "password"]
+    assert parse_enabled_types("") == DEFAULT_ENABLED_TYPES
     assert parse_enabled_types("invalid,credit_card") == ["credit_card"]
 
 
@@ -171,11 +175,12 @@ def test_redact_gitlab_token():
     assert "[REDACTED:key]" in result["clean_text"]
 
 
-def test_email_not_redacted_by_default():
-    """Email is defined but not in the default enabled list."""
+def test_email_redacted_by_default():
+    """Email is enabled in the default filter set (Ola2-PII)."""
     text = "contact me at user@example.com"
     result = filter_sensitive_text(text)  # uses defaults
-    assert "user@example.com" in result["clean_text"]
+    assert "[REDACTED:email]" in result["clean_text"]
+    assert "user@example.com" not in result["clean_text"]
 
 
 def test_email_redacted_when_enabled():
