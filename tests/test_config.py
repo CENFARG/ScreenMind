@@ -98,3 +98,35 @@ def test_google_api_key_field_removed():
     assert "google_api_key" not in Settings.model_fields
     with pytest.raises(ValidationError):
         Settings(data_dir="/tmp/test", google_api_key="leak")
+
+
+# ── Encryption mandatory (Ola2 / CT-05): fail-closed, no runtime disable ─────
+
+
+def test_encryption_enabled_default_true():
+    assert Settings(data_dir="/tmp/test").encryption_enabled is True
+
+
+def test_encryption_enabled_not_runtime_overridable():
+    """settings.json / dashboard cannot turn encryption off."""
+    from screenmind.config import _ALLOWED_OVERRIDES
+
+    assert "encryption_enabled" not in _ALLOWED_OVERRIDES
+
+
+def test_encryption_enabled_assignment_is_locked(caplog):
+    """validate_assignment stays fail-closed: later writes can't disable it."""
+    s = Settings(data_dir="/tmp/test")
+    with caplog.at_level(logging.WARNING, logger="screenmind.config"):
+        s.encryption_enabled = False
+    assert s.encryption_enabled is True
+    assert any("mandatory" in r.getMessage() for r in caplog.records)
+
+
+def test_encryption_enabled_env_cannot_disable(monkeypatch, caplog):
+    """ENCRYPTION_ENABLED=false in the environment is ignored (fail-closed)."""
+    monkeypatch.setenv("ENCRYPTION_ENABLED", "false")
+    with caplog.at_level(logging.WARNING, logger="screenmind.config"):
+        s = Settings(data_dir="/tmp/test")
+    assert s.encryption_enabled is True
+    assert any("mandatory" in r.getMessage() for r in caplog.records)

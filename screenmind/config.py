@@ -87,7 +87,9 @@ _ALLOWED_OVERRIDES = {
     "agents_enabled", "agents_auto_run_python",
     "sensitive_filter_enabled", "sensitive_filter_types",
     "dashboard_pin_hash", "dashboard_lock_timeout",
-    "encryption_enabled",
+    # NOTE: "encryption_enabled" is intentionally NOT listed here. Encryption at
+    # rest is mandatory and fail-closed (Ola2 / CT-05): settings.json / the
+    # dashboard cannot disable it at runtime.
     "bookmark_hotkey", "pause_hotkey", "voice_hotkey",
     "capture_active_monitor",
     "setup_complete",
@@ -277,7 +279,10 @@ class Settings(BaseSettings):
     sensitive_filter_types: str = Field(default="credit_card,ssn,api_key,jwt,password,email,cuit,cbu,alias,dni", description="Comma-separated filter types")
     dashboard_pin_hash: str = Field(default="", description="SHA-256 hash of dashboard PIN (empty = no lock)")
     dashboard_lock_timeout: int = Field(default=30, description="Minutes before dashboard auto-locks")
-    encryption_enabled: bool = Field(default=False, description="Encrypt screenshots at rest (AES via OS keyring)")
+    # MANDATORY, fail-closed (Ola2 / CT-05): screenshots are always encrypted at
+    # rest with a Fernet key held only in the OS keyring. The value is hard-locked
+    # to True (see _lock_encryption_on) and is not runtime-overridable.
+    encryption_enabled: bool = Field(default=True, description="Encrypt screenshots at rest (Fernet via OS keyring). Mandatory.")
 
     # ── Data Retention ───────────────────────────────────────────────────
     retention_days: int = Field(
@@ -314,6 +319,22 @@ class Settings(BaseSettings):
                 value,
             )
         return "local"
+
+    @field_validator("encryption_enabled", mode="before")
+    @classmethod
+    def _lock_encryption_on(cls, value):
+        """Fail-closed: at-rest encryption is mandatory and cannot be disabled.
+
+        Any attempt to turn it off (env var, settings.json or attribute write)
+        is ignored with a warning; the value is always True.
+        """
+        if value not in (True, 1, "true", "True", "1", "yes", "on"):
+            logger.warning(
+                "encryption_enabled=%r ignored - encryption at rest is mandatory "
+                "(fail-closed); using True.",
+                value,
+            )
+        return True
 
     # ── Derived Paths ────────────────────────────────────────────────────
 

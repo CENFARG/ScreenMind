@@ -239,12 +239,22 @@ class ScreenCapture:
                     optimize=True,
                 )
 
-                # Encrypt at rest if enabled (no-op when encryption_enabled=False)
+                # Encryption at rest is MANDATORY and fail-closed (Ola2 / CT-05).
+                from screenmind.privacy import encryption
                 try:
-                    from screenmind.privacy.encryption import encrypt_image
-                    encrypt_image(filepath)
-                except Exception:
-                    pass  # Never fail capture due to encryption
+                    encryption.encrypt_image(filepath)
+                except encryption.EncryptionUnavailable as exc:
+                    logger.error(
+                        "Encryption failed (%s) - capture quarantined, not persisted in clear",
+                        exc,
+                    )
+                    return None
+
+                # Backstop: never return a plaintext capture.
+                if not encryption.is_encrypted(filepath):
+                    encryption.quarantine_file(filepath, "post_encrypt_verification_failed")
+                    logger.error("Capture not encrypted after save - quarantined")
+                    return None
 
                 return filepath, img
 
