@@ -1,14 +1,49 @@
-"""Comprehensive tests for encryption at rest."""
-import pytest
+"""Comprehensive tests for encryption at rest (Ola2 / CT-05, fail-closed)."""
 import io
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 from PIL import Image
 
+import screenmind.privacy.encryption as enc
 from screenmind.privacy.encryption import (
     is_encrypted, encrypt_image, decrypt_image_bytes,
     open_image, serve_image, MAGIC, MAGIC_LEN,
+    EncryptionUnavailable, KEYRING_SERVICE, KEYRING_USERNAME,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_fernet_cache():
+    """Isolate the module-level Fernet cache between tests."""
+    enc._fernet_instance = None
+    yield
+    enc._fernet_instance = None
+
+
+@pytest.fixture
+def fake_keyring(monkeypatch):
+    """In-memory keyring stand-in; returns the backing store dict."""
+    store = {}
+
+    class _FakeKeyring:
+        def get_password(self, service, username):
+            return store.get((service, username))
+
+        def set_password(self, service, username, value):
+            store[(service, username)] = value
+
+    monkeypatch.setattr(enc, "_get_keyring", lambda: _FakeKeyring())
+    return store
+
+
+@pytest.fixture
+def tmp_data(monkeypatch, tmp_path):
+    """Point encryption's settings.data_path at a temp dir (real filesystem)."""
+    monkeypatch.setattr(enc, "settings", SimpleNamespace(data_path=tmp_path))
+    return tmp_path
 
 
 class TestIsEncrypted:
@@ -48,14 +83,12 @@ class TestIsEncrypted:
 class TestEncryptDecrypt:
     """Tests for encrypt/decrypt roundtrip."""
 
-    @patch("screenmind.privacy.encryption.settings")
-    def test_encrypt_disabled_returns_false(self, mock_settings, tmp_path):
-        """Encryption does nothing when disabled."""
-        mock_settings.encryption_enabled = False
+    def test_encrypt_active_by_default(self, tmp_path, fake_keyring, tmp_data):
+        """CT-05.1: encryption is active by default (no opt-in required)."""
         f = tmp_path / "test.jpg"
-        f.write_bytes(b"original data")
-        assert encrypt_image(f) is False
-        assert f.read_bytes() == b"original data"
+        f.write_bytes(b"\xff\xd8\xff\xe0" + b"image data here" * 20)
+        assert encrypt_image(f) is True
+        assert is_encrypted(f) is True
 
     @patch("screenmind.privacy.encryption._get_fernet")
     @patch("screenmind.privacy.encryption.settings")
@@ -182,3 +215,103 @@ class TestServeImage:
             response = serve_image(f)
         assert isinstance(response, Response)
         assert response.body == original_bytes
+
+
+class TestFailClosedQuarantine:
+    """CT-05.2: keyring/crypto failure -> quarantine, never persist in clear."""
+
+    def _bad_keyring(self, monkeypatch):
+        class _Broken:
+            def get_password(self, service, username):
+                raise RuntimeError("keyring backend unavailable")
+
+            def set_password(self, service, username, value):
+                raise RuntimeError("keyring backend unavailable")
+
+        monkeypatch.setattr(enc, "_get_keyring", lambda: _Broken())
+
+    def test_keyring_failure_quarantines_plaintext(self, monkeypatch, tmp_data):
+        """Keyring down -> file removed, audit record written, no plaintext left."""
+        self._bad_keyring(monkeypatch)
+        shots = tmp_data / "screenshots" / "2026-10-14"
+        shots.mkdir(parents=True)
+        f = shots / "12-00-00_000.jpg"
+        f.write_bytes(b"\xff\xd8\xff\xe0" + b"TOP SECRET PII" * 50)
+
+        with pytest.raises(EncryptionUnavailable):
+            encrypt_image(f)
+
+        assert not f.exists()  # not persisted in clear
+        assert not list(tmp_data.rglob("*.jpg"))  # nothing readable left behind
+
+        records = (tmp_data / "quarantine.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(records) == 1
+        assert "12-00-00_000.jpg" in records[0]
+        assert "keyring_unavailable" in records[0]
+
+    def test_encrypt_failure_quarantines_plaintext(self, monkeypatch, tmp_data):
+        """Crypto failure mid-encrypt -> quarantine + raise (fail-closed)."""
+
+        class _BoomFernet:
+            def encrypt(self, data):
+                raise ValueError("cipher blew up")
+
+        monkeypatch.setattr(enc, "_get_fernet", lambda: _BoomFernet())
+        f = tmp_data / "shot.jpg"
+        f.write_bytes(b"\xff\xd8" + b"plain" * 100)
+
+        with pytest.raises(EncryptionUnavailable):
+            encrypt_image(f)
+
+        assert not f.exists()
+        assert not list(tmp_data.rglob("*.jpg"))
+        recs = (tmp_data / "quarantine.jsonl").read_text(encoding="utf-8")
+        assert "encrypt_failed" in recs
+
+    def test_keyring_import_failure_is_fail_closed(self, monkeypatch):
+        """No keyring package -> EncryptionUnavailable (no weak fallback)."""
+        monkeypatch.setattr(enc, "_get_keyring", lambda: (_ for _ in ()).throw(
+            EncryptionUnavailable("keyring missing")
+        ))
+        with pytest.raises(EncryptionUnavailable):
+            enc._get_fernet()
+
+
+class TestKeyHygiene:
+    """CT-05.3: the key lives only in the OS keyring, never on disk in clear."""
+
+    def test_key_never_written_to_disk(self, fake_keyring, tmp_data, tmp_path):
+        f = tmp_path / "test.jpg"
+        f.write_bytes(b"\xff\xd8\xff\xe0" + b"data" * 50)
+        encrypt_image(f)
+
+        assert is_encrypted(f) is True
+        # No plaintext key file is ever created.
+        assert not (tmp_path / ".encryption_key").exists()
+        assert not list(tmp_path.rglob("*encryption_key*"))
+
+        key_bytes = fake_keyring[(KEYRING_SERVICE, KEYRING_USERNAME)].encode()
+        assert key_bytes  # a key was generated
+        # Key material must not leak into any file under the data dir.
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert key_bytes not in path.read_bytes()
+
+    def test_key_is_reused_from_keyring(self, fake_keyring, tmp_path):
+        first = enc._get_or_create_key()
+        enc._fernet_instance = None  # force re-read
+        second = enc._get_or_create_key()
+        assert first == second
+        assert fake_keyring[(KEYRING_SERVICE, KEYRING_USERNAME)].encode() == first
+
+    def test_keyring_write_failure_raises(self, monkeypatch):
+        class _NoWrite:
+            def get_password(self, service, username):
+                return None
+
+            def set_password(self, service, username, value):
+                raise RuntimeError("cannot persist to keyring")
+
+        monkeypatch.setattr(enc, "_get_keyring", lambda: _NoWrite())
+        with pytest.raises(EncryptionUnavailable):
+            enc._get_or_create_key()
